@@ -1,0 +1,16 @@
+# Local environment credentials
+.env
+
+# Python / local builds
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+build/
+dist/
+*.spec.bak
+
+# Local application data and browser artifacts
+*.db
+*.sqlite3
+output/

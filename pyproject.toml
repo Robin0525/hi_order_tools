@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hipersonalization-assistant"
+version = "0.13.0"
+description = "Batch image submission assistant for HiPersonalization sellers"
+requires-python = ">=3.11"
+dependencies = [
+  "beautifulsoup4>=4.12,<5",
+  "keyring>=25,<26",
+  "PySide6>=6.7,<7",
+  "requests>=2.31,<3",
+]
+
+[project.gui-scripts]
+hipersonalization-assistant = "hipersonalization_assistant.app:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
