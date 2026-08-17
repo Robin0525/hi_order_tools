@@ -19,37 +19,53 @@ class SubmissionStore:
             columns = {
                 row[1] for row in connection.execute("PRAGMA table_info(submissions)").fetchall()
             }
-            if "seller_id" in columns:
-                connection.execute("ALTER TABLE submissions RENAME TO submissions_v1")
+            legacy_table = bool(columns) and not {
+                "type_option",
+                "quantity",
+                "product_code",
+            }.issubset(columns)
+            if legacy_table:
+                connection.execute(
+                    "ALTER TABLE submissions RENAME TO submissions_legacy_configuration"
+                )
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS submissions (
                     order_id TEXT NOT NULL,
                     image_path TEXT NOT NULL,
+                    type_option TEXT NOT NULL,
+                    quantity INTEGER NOT NULL,
+                    product_code TEXT NOT NULL,
                     order_title TEXT NOT NULL,
                     status TEXT NOT NULL,
                     message TEXT NOT NULL DEFAULT '',
                     updated_at TEXT NOT NULL,
-                    PRIMARY KEY (order_id, image_path)
+                    PRIMARY KEY (
+                        order_id, image_path, type_option, quantity, product_code
+                    )
                 )
                 """
             )
-            if "seller_id" in columns:
+            if legacy_table:
                 connection.execute(
                     """
                     INSERT OR REPLACE INTO submissions
-                        (order_id, image_path, order_title, status, message, updated_at)
-                    SELECT order_id, image_path, order_title, status, message, updated_at
-                    FROM submissions_v1
+                        (order_id, image_path, type_option, quantity, product_code,
+                         order_title, status, message, updated_at)
+                    SELECT order_id, image_path, '', 0, '', order_title, status, message, updated_at
+                    FROM submissions_legacy_configuration
                     """
                 )
-                connection.execute("DROP TABLE submissions_v1")
+                connection.execute("DROP TABLE submissions_legacy_configuration")
 
     def record(
         self,
         *,
         order_id: str,
         image_path: Path,
+        type_option: str = "",
+        quantity: int = 0,
+        product_code: str = "",
         order_title: str,
         status: str,
         message: str = "",
@@ -59,9 +75,11 @@ class SubmissionStore:
             connection.execute(
                 """
                 INSERT INTO submissions
-                    (order_id, image_path, order_title, status, message, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(order_id, image_path) DO UPDATE SET
+                    (order_id, image_path, type_option, quantity, product_code,
+                     order_title, status, message, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(order_id, image_path, type_option, quantity, product_code)
+                DO UPDATE SET
                     status = excluded.status,
                     message = excluded.message,
                     updated_at = excluded.updated_at
@@ -69,6 +87,9 @@ class SubmissionStore:
                 (
                     order_id,
                     str(image_path.resolve()),
+                    type_option,
+                    quantity,
+                    product_code,
                     order_title,
                     status,
                     message,
@@ -76,10 +97,28 @@ class SubmissionStore:
                 ),
             )
 
-    def was_successful(self, order_id: str, image_path: Path) -> bool:
+    def was_successful(
+        self,
+        order_id: str,
+        image_path: Path,
+        *,
+        type_option: str = "",
+        quantity: int = 0,
+        product_code: str = "",
+    ) -> bool:
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT status FROM submissions WHERE order_id = ? AND image_path = ?",
-                (order_id, str(image_path.resolve())),
+                """
+                SELECT status FROM submissions
+                WHERE order_id = ? AND image_path = ? AND type_option = ?
+                  AND quantity = ? AND product_code = ?
+                """,
+                (
+                    order_id,
+                    str(image_path.resolve()),
+                    type_option,
+                    quantity,
+                    product_code,
+                ),
             ).fetchone()
         return bool(row and row[0] == "success")

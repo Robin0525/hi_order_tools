@@ -4,12 +4,21 @@ import pytest
 from bs4 import BeautifulSoup
 
 from hipersonalization_assistant.client import HiPersonalizationClient, HiPersonalizationError
-from hipersonalization_assistant.models import ConfirmationContext, ConfirmableProduct, OrderSummary, SelectOption
+from hipersonalization_assistant.models import (
+    ConfirmationContext,
+    ConfirmableProduct,
+    OrderSummary,
+    RecustomContext,
+    SellerShop,
+    SelectOption,
+    StampReplacementContext,
+)
 
 
 class FakeResponse:
     def __init__(self, text: str, url: str = "https://hipersonalization.com/page"):
         self.text = text
+        self.content = text.encode("utf-8")
         self.url = url
         self.status_code = 200
 
@@ -119,6 +128,9 @@ def test_fetch_orders_and_order_products_parse_confirmation_state(monkeypatch):
         ("215896", "image_confirmed", "BACK", "2", False),
     ]
     assert products[0].image_url == "https://hipersonalization.com/uploads/215895_small.png"
+    assert products[1].recustom_url.endswith(
+        "/recustom-order-generate-image/?image_order_product_id=215896"
+    )
     assert products[0].preview_url == "https://hipersonalization.com/uploads/215895.png"
 
 
@@ -256,3 +268,200 @@ def test_preview_image_url_removes_small_suffix_only():
     assert HiPersonalizationClient._preview_image_url(
         "https://hipersonalization.com/uploads/123.png"
     ) == "https://hipersonalization.com/uploads/123.png"
+
+
+def test_fetch_order_products_reads_delete_and_recustom_links(monkeypatch):
+    html = """
+    <table>
+      <tr><th>ID</th><th>TITLE</th><th>STATUS</th><th>option</th><th>qty</th><th>FUNCTIONS</th></tr>
+      <tr><td>220486</td><td>Front</td><td>image_created</td><td>FRONT</td><td>1</td><td>
+        <a href="/confirm-image-order-product-image/?image_order_product_id=220486">confirm</a>
+        <a href="/delete-unconfirmed-order-product/?image_order_product_id=220486">delete</a>
+        <a href="/recustom-order-generate-image/?image_order_product_id=220486">recustom</a>
+      </td></tr>
+    </table>
+    """
+    client = HiPersonalizationClient()
+    monkeypatch.setattr(client, "_get", lambda url: FakeResponse(html, url))
+    product = client.fetch_order_products(
+        OrderSummary("162372", "Test", "processing", "https://hipersonalization.com/products")
+    )[0]
+    assert "delete-unconfirmed-order-product" in product.delete_url
+    assert "recustom-order-generate-image" in product.recustom_url
+
+
+def test_order_products_page_reads_shipping_stamp_pdf(monkeypatch):
+    html = """
+    <div>order shipping stamp:
+      <a href="/uploads/shipping-label.pdf">shipping-label.pdf</a>
+    </div>
+    <table><tr><th>ID</th><th>TITLE</th></tr>
+      <tr><td>220486</td><td>Front</td></tr>
+    </table>
+    """
+    client = HiPersonalizationClient()
+    monkeypatch.setattr(client, "_get", lambda url: FakeResponse(html, url))
+    products, stamp_url = client.fetch_order_products_page(
+        OrderSummary("162372", "Test", "all_confirmed", "https://hipersonalization.com/products")
+    )
+    assert products[0].recustom_url.endswith("image_order_product_id=220486")
+    assert stamp_url == "https://hipersonalization.com/uploads/shipping-label.pdf"
+
+
+def test_delete_order_product_rejects_unexpected_url():
+    client = HiPersonalizationClient()
+    product = ConfirmableProduct(
+        "1",
+        "Design",
+        "image_created",
+        "FRONT",
+        "1",
+        delete_url="https://example.com/delete-unconfirmed-order-product/?id=1",
+    )
+    with pytest.raises(HiPersonalizationError, match="不属于"):
+        client.delete_order_product(product)
+
+
+def test_delete_order_product_opens_and_submits_confirmation_form(monkeypatch):
+    product = ConfirmableProduct(
+        "220531",
+        "Delete test",
+        "image_created",
+        "FRONT",
+        "1",
+        delete_url=(
+            "https://hipersonalization.com/delete-unconfirmed-order-product/"
+            "?image_order_product_id=220531"
+        ),
+    )
+    page = """
+    <form id="gform_104" action="/delete-unconfirmed-order-product/?image_order_product_id=220531">
+      <input name="state_104" value="token">
+      <input name="gform_submit" value="104">
+      <button type="submit" id="gform_submit_button_104">Submit</button>
+    </form>
+    """
+    calls = []
+    client = HiPersonalizationClient()
+    monkeypatch.setattr(client, "_get", lambda url: FakeResponse(page, url))
+
+    def fake_post(url, *, data, files=None):
+        calls.append((url, data, files))
+        return FakeResponse('<div id="gform_confirmation_message_104">deleted</div>', url)
+
+    monkeypatch.setattr(client, "_post", fake_post)
+    result = client.delete_order_product(product)
+    assert result.endswith("image_order_product_id=220531")
+    assert calls[0][1] == [("state_104", "token"), ("gform_submit", "104")]
+
+
+def test_fetch_seller_shops_and_shop_products(monkeypatch):
+    shops_html = """
+    <table><tr><th>ID</th><th>NAME</th><th>Functions</th></tr>
+      <tr><td>653</td><td>Robin Shop</td><td><a href="/list-image-products-by-image-shop-id-for-seller/?image_shop_id=653">products</a></td></tr>
+    </table>
+    """
+    products_html = """
+    <table><tr><th>NAME</th><th>IMAGE</th><th>SKU</th></tr>
+      <tr><td>Product One</td><td><a href="/uploads/p1.png"><img src="/uploads/p1.png"></a></td><td>132183</td></tr>
+    </table>
+    """
+    client = HiPersonalizationClient()
+    client.shops_page_url = "https://hipersonalization.com/list-seller-shop/?shop_seller=224"
+    monkeypatch.setattr(
+        client,
+        "_get",
+        lambda url: FakeResponse(products_html if "image_shop_id" in url else shops_html, url),
+    )
+    shop = client.fetch_seller_shops()[0]
+    assert shop == SellerShop(
+        "653",
+        "Robin Shop",
+        "https://hipersonalization.com/list-image-products-by-image-shop-id-for-seller/?image_shop_id=653",
+    )
+    product = client.fetch_shop_products(shop)[0]
+    assert (product.name, product.sku, product.image_url) == (
+        "Product One",
+        "132183",
+        "https://hipersonalization.com/uploads/p1_120.png",
+    )
+
+
+def test_prepare_recustom_and_stamp_replacement_read_live_field_mappings(monkeypatch):
+    recustom_html = """
+    <form id="gform_48" action="/recustom">
+      <input name="input_21" value="Code 1">
+      <select name="input_22"><option value="a">A</option><option value="b" selected>B</option></select>
+      <select name="input_7"><option value="no_frame" selected>no frame</option></select>
+      <textarea name="input_8">preserve me</textarea><input type="file" name="input_9">
+    </form>
+    """
+    stamp_html = """
+    <form id="gform_241" action="/stamp">
+      <input type="file" name="input_3">
+      <select name="input_4"><option value="letter">letter</option><option value="package">package</option></select>
+      <input type="file" name="input_5">
+    </form>
+    """
+    client = HiPersonalizationClient()
+    monkeypatch.setattr(
+        client,
+        "_get",
+        lambda url: FakeResponse(recustom_html if "recustom" in url else stamp_html, url),
+    )
+    recustom = client.prepare_recustom("220486")
+    assert recustom.product_code == "Code 1"
+    assert recustom.selected_type_option == "b"
+    assert ("input_8", "preserve me") in recustom.fields
+    stamp = client.prepare_stamp_replacement("162372")
+    assert [option.value for option in stamp.stamp_types] == ["letter", "package"]
+
+
+def test_recustom_and_stamp_replacement_submit_expected_fields_and_files(
+    tmp_path: Path, monkeypatch
+):
+    image = tmp_path / "new.png"
+    stamp = tmp_path / "stamp.pdf"
+    gift = tmp_path / "gift.pdf"
+    image.write_bytes(b"image")
+    stamp.write_bytes(b"%PDF-1.4 stamp")
+    gift.write_bytes(b"%PDF-1.4 gift")
+    calls = []
+    client = HiPersonalizationClient()
+
+    def fake_post(url, *, data, files=None):
+        calls.append((url, data, sorted(files or {})))
+        form_id = "48" if "recustom" in url else "241"
+        return FakeResponse(
+            f'<div id="gform_confirmation_message_{form_id}">done</div>', url
+        )
+
+    monkeypatch.setattr(client, "_post", fake_post)
+    client.submit_recustom(
+        RecustomContext(
+            "https://hipersonalization.com/recustom",
+            (("input_7", "no_frame"), ("input_8", "preserve")),
+            "220486",
+            "Old",
+            (SelectOption("5502", "Option"),),
+            "5502",
+        ),
+        product_code="New Code",
+        type_option_value="5502",
+        image_path=image,
+    )
+    client.submit_stamp_replacement(
+        StampReplacementContext(
+            "https://hipersonalization.com/stamp",
+            (("state", "token"),),
+            (SelectOption("letter", "letter"),),
+        ),
+        stamp=stamp,
+        stamp_type="letter",
+        gift_message=gift,
+    )
+    assert ("input_21", "New Code") in calls[0][1]
+    assert ("input_22", "5502") in calls[0][1]
+    assert calls[0][2] == ["input_9"]
+    assert ("input_4", "letter") in calls[1][1]
+    assert calls[1][2] == ["input_3", "input_5"]

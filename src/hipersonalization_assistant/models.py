@@ -24,6 +24,24 @@ class ProductOption:
 
 
 @dataclass(frozen=True)
+class SellerShop:
+    shop_id: str
+    name: str
+    products_url: str
+
+    @property
+    def label(self) -> str:
+        return f"ID: {self.shop_id} | NAME: {self.name}"
+
+
+@dataclass(frozen=True)
+class ShopProduct:
+    name: str
+    sku: str
+    image_url: str = ""
+
+
+@dataclass(frozen=True)
 class DefinitionOption:
     definition_id: str
     label: str
@@ -62,6 +80,8 @@ class ConfirmableProduct:
     confirm_url: str = ""
     image_url: str = ""
     preview_url: str = ""
+    delete_url: str = ""
+    recustom_url: str = ""
 
 
 @dataclass(frozen=True)
@@ -69,6 +89,23 @@ class ConfirmationContext:
     url: str
     fields: tuple[tuple[str, str], ...]
     stamp_types: tuple[SelectOption, ...]
+
+
+@dataclass(frozen=True)
+class StampReplacementContext:
+    url: str
+    fields: tuple[tuple[str, str], ...]
+    stamp_types: tuple[SelectOption, ...]
+
+
+@dataclass(frozen=True)
+class RecustomContext:
+    url: str
+    fields: tuple[tuple[str, str], ...]
+    product_id: str
+    product_code: str
+    type_options: tuple[SelectOption, ...]
+    selected_type_option: str = ""
 
 
 @dataclass(frozen=True)

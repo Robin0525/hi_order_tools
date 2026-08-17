@@ -22,7 +22,11 @@ from .models import (
     DefinitionOption,
     OrderSummary,
     ProductOption,
+    RecustomContext,
+    SellerShop,
     SelectOption,
+    ShopProduct,
+    StampReplacementContext,
     UploadContext,
 )
 
@@ -52,6 +56,7 @@ class HiPersonalizationClient:
         self.session.headers.update({"User-Agent": "HiPersonalization-Assistant/0.1"})
         self.logged_in = False
         self.orders_page_url = ""
+        self.shops_page_url = ""
         self._product_seller = ""
 
     def _url(self, path: str) -> str:
@@ -116,6 +121,7 @@ class HiPersonalizationClient:
         self.logged_in = True
         home = self._get(self._url("/"))
         self.orders_page_url = self._find_orders_url(home.text, home.url)
+        self.shops_page_url = self._find_seller_shops_url(home.text, home.url)
         self._product_seller = parse_qs(urlparse(self.orders_page_url).query).get(
             "product_seller", [""]
         )[0]
@@ -131,6 +137,16 @@ class HiPersonalizationClient:
             if text == "list-my-orders":
                 return urljoin(current_url, str(link["href"]))
         raise AuthenticationError("已登录，但首页没有找到 list-my-orders 链接。")
+
+    @staticmethod
+    def _find_seller_shops_url(html: str, current_url: str) -> str:
+        soup = BeautifulSoup(html, "html.parser")
+        for link in soup.find_all("a", href=True):
+            text = clean_text(link.get_text(" ", strip=True)).casefold()
+            target = urljoin(current_url, str(link["href"]))
+            if text == "list-my-seller-shops" or "list-seller-shop" in urlparse(target).path:
+                return target
+        raise AuthenticationError("已登录，但首页没有找到 list-my-seller-shops 链接。")
 
     @staticmethod
     def _with_query(path: str, **values: str) -> str:
@@ -310,7 +326,32 @@ class HiPersonalizationClient:
             return urlunparse(parsed._replace(path=f"{stem[:-6]}.{extension}"))
         return image_url
 
-    def fetch_order_products(self, order: OrderSummary) -> list[ConfirmableProduct]:
+    @staticmethod
+    def _thumbnail_120_url(image_url: str) -> str:
+        """Use the site's small derivative instead of downloading a full product image."""
+        parsed = urlparse(image_url)
+        stem, separator, extension = parsed.path.rpartition(".")
+        if not separator or stem.endswith("_120"):
+            return image_url
+        return urlunparse(parsed._replace(path=f"{stem}_120.{extension}"))
+
+    @staticmethod
+    def _shipping_stamp_url(soup: BeautifulSoup, current_url: str) -> str:
+        for node in soup.find_all(string=lambda value: value and "order shipping stamp" in value.casefold()):
+            current = node.parent
+            for _ in range(4):
+                if current is None:
+                    break
+                for link in current.find_all("a", href=True):
+                    target = urljoin(current_url, str(link["href"]))
+                    if urlparse(target).path.casefold().endswith(".pdf"):
+                        return target
+                current = current.parent
+        return ""
+
+    def fetch_order_products_page(
+        self, order: OrderSummary
+    ) -> tuple[list[ConfirmableProduct], str]:
         response = self._get(order.products_url)
         soup = BeautifulSoup(response.text, "html.parser")
         products: list[ConfirmableProduct] = []
@@ -320,14 +361,25 @@ class HiPersonalizationClient:
             if not product_id:
                 continue
             confirm_url = ""
+            delete_url = ""
+            recustom_url = ""
             image = row.find("img")
             image_url = (
                 urljoin(response.url, str(image.get("src") or "")) if image else ""
             )
             for link in row.find_all("a", href=True):
-                if clean_text(link.get_text(" ", strip=True)).casefold() == "confirm":
-                    confirm_url = urljoin(response.url, str(link["href"]))
-                    break
+                function_name = clean_text(link.get_text(" ", strip=True)).casefold()
+                target = urljoin(response.url, str(link["href"]))
+                if function_name == "confirm":
+                    confirm_url = target
+                elif function_name == "delete":
+                    delete_url = target
+                elif function_name == "recustom":
+                    recustom_url = target
+            if product_id and not recustom_url:
+                recustom_url = self._url(
+                    f"/recustom-order-generate-image/?image_order_product_id={product_id}"
+                )
             products.append(
                 ConfirmableProduct(
                     product_id=product_id,
@@ -338,10 +390,102 @@ class HiPersonalizationClient:
                     confirm_url=confirm_url,
                     image_url=image_url,
                     preview_url=self._preview_image_url(image_url),
+                    delete_url=delete_url,
+                    recustom_url=recustom_url,
                 )
             )
         if not products:
             raise HiPersonalizationError(f"Order {order.order_id} 中没有找到设计产品。")
+        return products, self._shipping_stamp_url(soup, response.url)
+
+    def fetch_order_products(self, order: OrderSummary) -> list[ConfirmableProduct]:
+        products, _shipping_stamp_url = self.fetch_order_products_page(order)
+        return products
+
+    def delete_order_product(self, product: ConfirmableProduct) -> str:
+        if not product.delete_url:
+            raise HiPersonalizationError(f"设计 {product.product_id} 没有可用的 Delete 功能。")
+        parsed = urlparse(product.delete_url)
+        if parsed.netloc.casefold() != urlparse(self.base_url).netloc.casefold():
+            raise HiPersonalizationError("Delete 地址不属于 HiPersonalization 网站。")
+        if "delete-unconfirmed-order-product" not in parsed.path:
+            raise HiPersonalizationError("Delete 地址与预期页面不一致，已停止操作。")
+        page = self._get(product.delete_url)
+        if "Sorry, you are not authorized" in page.text:
+            raise AuthenticationError("当前 seller 没有删除该设计的权限。")
+        form = find_form(page.text, "gform_104")
+        response = self._post(form_action(form, page.url), data=serialize_form(form))
+        errors = validation_messages(response.text)
+        if errors:
+            raise RemoteValidationError("；".join(errors))
+        soup = BeautifulSoup(response.text, "html.parser")
+        if soup.find("form", id="gform_104") is not None and soup.find(
+            id="gform_confirmation_message_104"
+        ) is None:
+            raise RemoteValidationError("网站仍停留在删除确认表单，但没有返回明确的成功提示。")
+        return response.url
+
+    def fetch_seller_shops(self) -> list[SellerShop]:
+        if not self.shops_page_url:
+            raise AuthenticationError("请先登录 seller 账号。")
+        response = self._get(self.shops_page_url)
+        soup = BeautifulSoup(response.content, "html.parser")
+        shops: list[SellerShop] = []
+        seen: set[str] = set()
+        for link in soup.find_all("a", href=True):
+            target = urljoin(response.url, str(link["href"]))
+            parsed = urlparse(target)
+            if "list-image-products-by-image-shop-id-for-seller" not in parsed.path:
+                continue
+            shop_id = parse_qs(parsed.query).get("image_shop_id", [""])[0]
+            if not shop_id or shop_id in seen:
+                continue
+            values = self._table_values(link.find_parent("tr"))
+            shops.append(
+                SellerShop(
+                    shop_id=shop_id,
+                    name=values.get("NAME", "") or f"Shop {shop_id}",
+                    products_url=target,
+                )
+            )
+            seen.add(shop_id)
+        if not shops:
+            raise HiPersonalizationError("当前 seller 的 Shop 列表中没有找到可读取的 Shop。")
+        return shops
+
+    def fetch_shop_products(self, shop: SellerShop) -> list[ShopProduct]:
+        parsed = urlparse(shop.products_url)
+        if parsed.netloc.casefold() != urlparse(self.base_url).netloc.casefold():
+            raise HiPersonalizationError("Shop Products 地址不属于 HiPersonalization 网站。")
+        response = self._get(shop.products_url)
+        soup = BeautifulSoup(response.content, "html.parser")
+        products: list[ShopProduct] = []
+        for row in soup.find_all("tr"):
+            values = self._table_values(row)
+            name = values.get("NAME", "")
+            sku = values.get("SKU", "")
+            if not name and not sku:
+                continue
+            image_url = ""
+            image = row.find("img")
+            if image:
+                image_url = urljoin(
+                    response.url,
+                    str(image.get("src") or image.get("data-src") or ""),
+                )
+            if not image_url:
+                for link in row.find_all("a", href=True):
+                    candidate = urljoin(response.url, str(link["href"]))
+                    if urlparse(candidate).path.casefold().endswith(
+                        (".png", ".jpg", ".jpeg", ".webp")
+                    ):
+                        image_url = candidate
+                        break
+            if image_url:
+                image_url = self._thumbnail_120_url(image_url)
+            products.append(ShopProduct(name=name, sku=sku, image_url=image_url))
+        if not products:
+            raise HiPersonalizationError(f"Shop {shop.shop_id} 中没有找到产品。")
         return products
 
     def prepare_confirmation(self, product: ConfirmableProduct) -> ConfirmationContext:
@@ -411,6 +555,123 @@ class HiPersonalizationClient:
             id="gform_confirmation_message_47"
         ) is None:
             raise RemoteValidationError("网站仍停留在确认表单，但没有返回明确的成功提示。")
+        return response.url
+
+    @staticmethod
+    def _normalized_numeric_id(value: str, label: str) -> str:
+        normalized = value.strip()
+        if not normalized or not normalized.isdigit():
+            raise HiPersonalizationError(f"{label} 必须是数字。")
+        return normalized
+
+    def prepare_recustom(self, product_id: str) -> RecustomContext:
+        normalized = self._normalized_numeric_id(product_id, "Product ID")
+        url = self._url(
+            f"/recustom-order-generate-image/?image_order_product_id={normalized}"
+        )
+        response = self._get(url)
+        form = find_form(response.text, "gform_48")
+        options = tuple(select_options(form, "input_22"))
+        code_field = form.find(attrs={"name": "input_21"})
+        type_field = form.find("select", attrs={"name": "input_22"})
+        selected = type_field.find("option", selected=True) if type_field else None
+        return RecustomContext(
+            url=form_action(form, response.url),
+            fields=tuple(serialize_form(form)),
+            product_id=normalized,
+            product_code=str(code_field.get("value") or "") if code_field else "",
+            type_options=options,
+            selected_type_option=str(selected.get("value") or "") if selected else "",
+        )
+
+    def submit_recustom(
+        self,
+        context: RecustomContext,
+        *,
+        product_code: str,
+        type_option_value: str,
+        image_path: Path,
+    ) -> str:
+        code = product_code.strip()
+        if not code:
+            raise HiPersonalizationError("Order Product Code 不能为空。")
+        available = {option.value for option in context.type_options}
+        if type_option_value not in available:
+            raise HiPersonalizationError("请选择有效的 Product Type Option。")
+        image = image_path.resolve()
+        if not image.is_file():
+            raise HiPersonalizationError(f"First Image 不存在：{image}")
+        if image.stat().st_size > self.MAX_IMAGE_BYTES:
+            raise HiPersonalizationError(f"First Image 超过 80 MB：{image.name}")
+        data = self._replace_fields(
+            context.fields,
+            {"input_21": code, "input_22": type_option_value},
+        )
+        mime_type = mimetypes.guess_type(image.name)[0] or "application/octet-stream"
+        with image.open("rb") as stream:
+            response = self._post(
+                context.url,
+                data=data,
+                files={"input_9": (image.name, stream, mime_type)},
+            )
+        errors = validation_messages(response.text)
+        if errors:
+            raise RemoteValidationError("；".join(errors))
+        soup = BeautifulSoup(response.text, "html.parser")
+        if soup.find("form", id="gform_48") is not None and soup.find(
+            id="gform_confirmation_message_48"
+        ) is None:
+            raise RemoteValidationError("网站仍停留在替换设计表单，但没有返回明确的成功提示。")
+        return response.url
+
+    def prepare_stamp_replacement(self, order_id: str) -> StampReplacementContext:
+        normalized = self._normalized_numeric_id(order_id, "Order ID")
+        url = self._url(f"/add_stamp_to_order_by_order_id/?order_id={normalized}")
+        response = self._get(url)
+        form = find_form(response.text, "gform_241")
+        return StampReplacementContext(
+            url=form_action(form, response.url),
+            fields=tuple(serialize_form(form)),
+            stamp_types=tuple(select_options(form, "input_4")),
+        )
+
+    def submit_stamp_replacement(
+        self,
+        context: StampReplacementContext,
+        *,
+        stamp: Path,
+        stamp_type: str,
+        gift_message: Path | None = None,
+    ) -> str:
+        available = {option.value for option in context.stamp_types}
+        if stamp_type not in available:
+            raise HiPersonalizationError("请选择有效的 Stamp Type。")
+        stamp_pdf = self._validate_pdf(stamp, "Stamp")
+        gift_pdf = self._validate_pdf(gift_message, "Gift Message") if gift_message else None
+        data = self._replace_fields(context.fields, {"input_4": stamp_type})
+        with ExitStack() as stack:
+            files: dict[str, tuple[str, object, str]] = {
+                "input_3": (
+                    stamp_pdf.name,
+                    stack.enter_context(stamp_pdf.open("rb")),
+                    "application/pdf",
+                )
+            }
+            if gift_pdf:
+                files["input_5"] = (
+                    gift_pdf.name,
+                    stack.enter_context(gift_pdf.open("rb")),
+                    "application/pdf",
+                )
+            response = self._post(context.url, data=data, files=files)
+        errors = validation_messages(response.text)
+        if errors:
+            raise RemoteValidationError("；".join(errors))
+        soup = BeautifulSoup(response.text, "html.parser")
+        if soup.find("form", id="gform_241") is not None and soup.find(
+            id="gform_confirmation_message_241"
+        ) is None:
+            raise RemoteValidationError("网站仍停留在替补邮票表单，但没有返回明确的成功提示。")
         return response.url
 
     def fetch_order_status(self, order_id: str) -> str:

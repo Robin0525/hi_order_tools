@@ -1,10 +1,10 @@
-# hipersonalization订单处理助手 v0.13 by Robin+Codex
+# hipersonalization订单处理助手 v0.14 by Robin+Codex
 
 这是一个面向 HiPersonalization seller 的 Windows 桌面工具。用户创建一次订单、选择一次 Product / Definition / Type / Type Option 后，可以一次选择多张本地图片；程序会逐张调用网站表单，完成原本需要重复操作的添加产品和图片上传流程。
 
 ## 当前版本
 
-`v0.13` 包含：
+`v0.14` 包含：
 
 - Seller 账号登录和权限验证；登录后从首页自动发现 `list-my-orders`。
 - 支持保存多个 Seller 账号并通过下拉列表切换。
@@ -28,7 +28,7 @@
 - 创建订单区域将“开始新 Order”放在最左侧，Order ID 放在 Order Title 前方。
 - 网站配置区域按 Product、Definition、Product Type 三行展示，每行包含对应下拉框和下一步读取按钮。
 - 单张失败不影响后续图片。
-- 使用本地 SQLite 记录结果；再次提交时自动跳过已经成功的图片。
+- 使用本地 SQLite 记录结果；再次提交时只跳过 Order、图片、Type Option、Quantity 和最终 Product Code 均相同的成功记录，同图不同选项可继续提交。
 - 图片大小上限预检查（80 MB）。
 - 从网站读取 Order 列表，并可按 Order ID、Title 或 Status 筛选。
 - 读取目标 Order 的全部设计、产品状态、Type Option 和 Quantity。
@@ -44,6 +44,17 @@
 - “当前 Order 继续添加 SKU”移动到新建 Order 按钮右侧，批量图片操作按钮和默认设置合并为一行。
 - 订单确认的“读取订单列表”默认仅处理最新前 20 个 Order，并只为这 20 个读取缩略图；订单列表页面的读取等待时间独立设为最多 120 秒，以适应历史订单较多的 seller。
 - 对订单量特别大的 seller，可直接输入唯一的 Order ID 并读取该 Order 的设计清单，完全跳过超长订单列表；确认后会直接核查该 Order 是否仍存在待确认设计。
+- 允许同一张本地图片重复加入批量列表；仅完全相同的成功提交配置会自动跳过，避免误重复提交。
+- Product Type 选择完成后自动读取 Type Options，无需再手动点击。
+- 新增“SKU 查询”分页：从首页的 `list-my-seller-shops` 读取 Shop，并显示对应 Products 的 Image、Name 和 SKU。
+- 新增“替换设计”分页：按 Product ID 读取 form 48，可修改 Order Product Code、Product Type Option 和 First Image。
+- 新增“替补邮票”分页：按已 Confirm 的 Order ID 读取 form 241，可提交或替换 Stamp PDF、Stamp Type 和可选 Gift Message PDF。
+- 订单确认设计清单将 ID 标为 Product ID，并为网站提供的设计显示 Delete 和 Recustom 操作；Delete 具有二次确认，Recustom 会跳转并载入“替换设计”分页。
+- Delete 会继续提交网站底部的删除确认表单；已确认设计也始终可以按 Product ID 进入 Recustom。
+- 订单确认页显示可点击的 Order Shipping Stamp PDF，并在确认后即时同步当前 Order 状态。
+- SKU 查询位于最右侧分页，只读取网站 `_120` 小缩略图，Name 与 SKU 使用等宽列。
+
+详细变更记录见 [CHANGELOG.md](CHANGELOG.md)。
 
 当前批次中的图片共用同一个 SKU、Definition 和 Product Type，但每张图片可以使用不同的 Type Option、Quantity 和 Code 后缀。
 
@@ -91,6 +102,12 @@ HIPERSONALIZATION_SELLER_PASSWORD=
 5. 工具最后重新读取订单状态；只有显示 `all_confirmed` 才表示整个 Order 确认完成。
 6. 如果中途失败，重新读取该 Order 后再次执行；已有 `image_confirmed` 设计会被跳过，Shipping Stamp 不会重复上传。
 
+SKU 查询流程：登录后切换到“SKU 查询”，读取 Shop 列表，选择目标 Shop 后读取 Products；可按 Name 或 SKU 筛选。
+
+替换设计流程：输入数字 Product ID 并读取配置，检查原 Order Product Code 和当前 Product Type Option，选择新的 First Image 后确认提交。该操作会覆盖线上设计。
+
+替补邮票流程：输入已 Confirm 订单的数字 Order ID，读取配置后选择 Stamp PDF 与 Stamp Type；Gift Message PDF 可选，确认后提交或替换。
+
 Code 生成规则：
 
 - 普通图片，无后缀：`robin test2026`
@@ -118,7 +135,7 @@ python -m pip install pyinstaller
 python -m PyInstaller hipersonalization_assistant.spec --clean --noconfirm
 ```
 
-输出文件位于 `dist/hipersonalization订单处理助手 v0.13 by Robin+Codex.exe`。不要把 `.env`、测试账号或本地历史数据库加入安装包。
+输出文件位于 `dist/hipersonalization订单处理助手 v0.14 by Robin+Codex.exe`。不要把 `.env`、测试账号或本地历史数据库加入安装包。
 
 Seller 用户可以直接复制这一份 EXE 到自己的 Windows 电脑运行，不需要同时发送 `.env`、源代码或图标文件。首次运行时由用户在软件内输入自己的账号和密码。
 
@@ -131,7 +148,7 @@ chmod +x scripts/build_macos.sh
 ./scripts/build_macos.sh
 ```
 
-打包结果位于 `dist/hipersonalization订单处理助手 v0.13 by Robin+Codex.app`。这是未签名测试版；首次启动如被 macOS 拦截，请在 Finder 中右键该应用并选择“打开”，再确认一次即可。不要将 `.env`、本地账号资料或订单历史随应用发送。
+打包结果位于 `dist/hipersonalization订单处理助手 v0.14 by Robin+Codex.app`。这是未签名测试版；首次启动如被 macOS 拦截，请在 Finder 中右键该应用并选择“打开”，再确认一次即可。不要将 `.env`、本地账号资料或订单历史随应用发送。
 
 本地账号数据不会写入 EXE 所在目录：
 

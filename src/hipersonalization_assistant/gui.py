@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import os
 from collections.abc import Callable
+from dataclasses import replace
+from html import escape
 from pathlib import Path
 from typing import Any
 
 from PySide6.QtCore import QObject, QRunnable, QSize, QThreadPool, QTimer, Qt, Signal, Slot
-from PySide6.QtGui import QCloseEvent, QIcon, QImageReader, QMouseEvent, QPixmap
+from PySide6.QtGui import QBrush, QCloseEvent, QColor, QIcon, QImageReader, QMouseEvent, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -43,7 +45,11 @@ from .models import (
     ImageSubmissionTask,
     OrderSummary,
     ProductOption,
+    RecustomContext,
+    SellerShop,
     SelectOption,
+    ShopProduct,
+    StampReplacementContext,
     SubmissionResult,
     build_product_code,
 )
@@ -223,6 +229,16 @@ def compact_field(label: str, control: QWidget, *, expandable: bool = False) -> 
     return field
 
 
+def feature_instructions(text: str) -> QLabel:
+    label = QLabel(f"功能说明：\n{text}")
+    label.setWordWrap(True)
+    label.setStyleSheet(
+        "background-color: #FCE4EC; color: #4A2633; "
+        "border: 1px solid #F8BBD0; border-radius: 4px; padding: 8px;"
+    )
+    return label
+
+
 class MainWindow(QMainWindow):
     IMAGE_FILTER = "Images (*.png *.jpg *.jpeg *.webp *.tif *.tiff *.bmp);;All files (*)"
     CONFIRMATION_ORDER_LIMIT = 20
@@ -236,6 +252,7 @@ class MainWindow(QMainWindow):
         self.created_order_title = ""
         self.batch_completed_successfully = False
         self._pending_auto_types = False
+        self._pending_auto_options = False
         self.available_type_options: list[SelectOption] = []
         self.confirmation_orders: list[OrderSummary] = []
         self.confirmation_order_thumbnails: dict[str, bytes] = {}
@@ -243,6 +260,11 @@ class MainWindow(QMainWindow):
         self.confirmation_products: list[ConfirmableProduct] = []
         self.confirmation_product_thumbnails: dict[str, bytes] = {}
         self.confirmation_requires_stamp = True
+        self.seller_shops: list[SellerShop] = []
+        self.shop_products: list[ShopProduct] = []
+        self.shop_product_thumbnails: dict[int, bytes] = {}
+        self.recustom_context: RecustomContext | None = None
+        self.stamp_replacement_context: StampReplacementContext | None = None
         self.thread_pool = QThreadPool(self)
         self.thread_pool.setMaxThreadCount(1)
         self.thread_pool.setExpiryTimeout(1000)
@@ -251,7 +273,7 @@ class MainWindow(QMainWindow):
         self._busy = False
         self._active_workers: set[FunctionWorker] = set()
 
-        self.setWindowTitle("hipersonalization订单处理助手 v0.13 by Robin+Codex")
+        self.setWindowTitle("hipersonalization订单处理助手 v0.14 by Robin+Codex")
         self.setWindowIcon(QIcon(str(resource_path("assets/hipersonalization.ico"))))
         self.resize(1280, 820)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
@@ -292,12 +314,21 @@ class MainWindow(QMainWindow):
         layout.addWidget(account_box)
 
         self.workflow_tabs = QTabWidget()
-        submit_tab = QWidget()
-        submit_layout = QVBoxLayout(submit_tab)
-        confirmation_tab = QWidget()
-        confirmation_layout = QVBoxLayout(confirmation_tab)
-        self.workflow_tabs.addTab(submit_tab, "订单提交")
-        self.workflow_tabs.addTab(confirmation_tab, "订单确认")
+        self.submit_tab = QWidget()
+        submit_layout = QVBoxLayout(self.submit_tab)
+        self.sku_query_tab = QWidget()
+        sku_query_layout = QVBoxLayout(self.sku_query_tab)
+        self.confirmation_tab = QWidget()
+        confirmation_layout = QVBoxLayout(self.confirmation_tab)
+        self.recustom_tab = QWidget()
+        recustom_layout = QVBoxLayout(self.recustom_tab)
+        self.stamp_replacement_tab = QWidget()
+        stamp_replacement_layout = QVBoxLayout(self.stamp_replacement_tab)
+        self.workflow_tabs.addTab(self.submit_tab, "订单提交")
+        self.workflow_tabs.addTab(self.confirmation_tab, "订单确认")
+        self.workflow_tabs.addTab(self.recustom_tab, "替换设计")
+        self.workflow_tabs.addTab(self.stamp_replacement_tab, "替补邮票")
+        self.workflow_tabs.addTab(self.sku_query_tab, "SKU 查询")
         self.workflow_tabs.currentChanged.connect(self._workflow_tab_changed)
         layout.addWidget(self.workflow_tabs, 1)
 
@@ -357,7 +388,7 @@ class MainWindow(QMainWindow):
         self.load_types_button.clicked.connect(self._load_types)
         self.load_options_button.clicked.connect(self._load_type_options)
         self.definition_combo.currentIndexChanged.connect(self._auto_load_types)
-        self.type_combo.currentIndexChanged.connect(self._invalidate_type_options)
+        self.type_combo.currentIndexChanged.connect(self._auto_load_type_options)
         configuration_labels = (
             QLabel("Product"),
             QLabel("Definition"),
@@ -468,8 +499,132 @@ class MainWindow(QMainWindow):
         self.log_edit.setReadOnly(True)
         self.log_edit.setMaximumHeight(130)
         submit_layout.addWidget(self.log_edit)
+        self._build_sku_query_ui(sku_query_layout)
         self._build_confirmation_ui(confirmation_layout)
+        self._build_recustom_ui(recustom_layout)
+        self._build_stamp_replacement_ui(stamp_replacement_layout)
         self.setCentralWidget(root)
+
+    def _build_sku_query_ui(self, layout: QVBoxLayout) -> None:
+        controls = QGroupBox("2. 选择 Seller Shop")
+        controls_layout = QHBoxLayout(controls)
+        self.refresh_shops_button = QPushButton("读取 Shop 列表")
+        self.refresh_shops_button.clicked.connect(self._load_seller_shops)
+        self.seller_shop_combo = FullTextComboBox()
+        self.seller_shop_combo.setMinimumWidth(360)
+        self.load_shop_products_button = QPushButton("读取该 Shop Products")
+        self.load_shop_products_button.clicked.connect(self._load_shop_products)
+        self.shop_product_filter_edit = QLineEdit()
+        self.shop_product_filter_edit.setPlaceholderText("按 Name 或 SKU 筛选")
+        self.shop_product_filter_edit.textChanged.connect(self._filter_shop_products)
+        controls_layout.addWidget(self.refresh_shops_button)
+        controls_layout.addWidget(compact_field("Shop", self.seller_shop_combo), 0)
+        controls_layout.addWidget(self.load_shop_products_button)
+        controls_layout.addWidget(compact_field("筛选", self.shop_product_filter_edit, expandable=True), 1)
+        layout.addWidget(controls)
+
+        self.shop_products_table = QTableWidget(0, 3)
+        self.shop_products_table.setHorizontalHeaderLabels(["Image", "Name", "SKU"])
+        self.shop_products_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        shop_header = self.shop_products_table.horizontalHeader()
+        shop_header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        shop_header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        shop_header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        layout.addWidget(self.shop_products_table, 1)
+        self.sku_query_status_label = QLabel("尚未读取 Shop Products")
+        layout.addWidget(self.sku_query_status_label)
+
+    def _build_recustom_ui(self, layout: QVBoxLayout) -> None:
+        self.recustom_instructions_label = feature_instructions(
+            "1.用于替换订单内product的设计，注意是填写Product ID。\n"
+            "2.已confirm且未生产的订单亦可以替换（需和生产人员沟通清楚）。\n"
+            "3.注意！已生产的订单请勿修改设计图。"
+        )
+        layout.addWidget(self.recustom_instructions_label)
+        load_box = QGroupBox("2. 读取待替换设计")
+        load_layout = QHBoxLayout(load_box)
+        self.recustom_product_id_edit = QLineEdit()
+        self.recustom_product_id_edit.setPlaceholderText("仅填写数字 Product ID")
+        self.recustom_product_id_edit.setMaximumWidth(180)
+        self.load_recustom_button = QPushButton("读取替换设计配置")
+        self.load_recustom_button.clicked.connect(self._load_recustom_context)
+        self.recustom_status_label = QLabel("尚未读取 Product")
+        load_layout.addWidget(compact_field("Product ID", self.recustom_product_id_edit))
+        load_layout.addWidget(self.load_recustom_button)
+        load_layout.addWidget(self.recustom_status_label)
+        load_layout.addStretch(1)
+        layout.addWidget(load_box)
+
+        form_box = QGroupBox("3. 替换设计内容")
+        form_layout = QGridLayout(form_box)
+        self.recustom_code_edit = QLineEdit()
+        self.recustom_type_option_combo = FullTextComboBox()
+        self.recustom_image_edit = QLineEdit()
+        self.recustom_image_edit.setReadOnly(True)
+        self.select_recustom_image_button = QPushButton("选择 First Image")
+        self.select_recustom_image_button.clicked.connect(self._select_recustom_image)
+        form_layout.addWidget(QLabel("Order Product Code"), 0, 0)
+        form_layout.addWidget(self.recustom_code_edit, 0, 1, 1, 2)
+        form_layout.addWidget(QLabel("Product Type Option"), 1, 0)
+        form_layout.addWidget(self.recustom_type_option_combo, 1, 1, 1, 2)
+        form_layout.addWidget(QLabel("First Image"), 2, 0)
+        form_layout.addWidget(self.recustom_image_edit, 2, 1)
+        form_layout.addWidget(self.select_recustom_image_button, 2, 2)
+        form_layout.setColumnStretch(1, 1)
+        layout.addWidget(form_box)
+        self.submit_recustom_button = QPushButton("确认并提交替换设计")
+        self.submit_recustom_button.clicked.connect(self._submit_recustom)
+        layout.addWidget(self.submit_recustom_button, 0, Qt.AlignmentFlag.AlignRight)
+        self.recustom_log_edit = QTextEdit()
+        self.recustom_log_edit.setReadOnly(True)
+        layout.addWidget(self.recustom_log_edit, 1)
+
+    def _build_stamp_replacement_ui(self, layout: QVBoxLayout) -> None:
+        self.stamp_replacement_instructions_label = feature_instructions(
+            "1.只用于已confirm的订单，可替换订单的邮票（需和生产人员沟通清楚）。"
+        )
+        layout.addWidget(self.stamp_replacement_instructions_label)
+        load_box = QGroupBox("2. 读取订单邮票配置")
+        load_layout = QHBoxLayout(load_box)
+        self.stamp_order_id_edit = QLineEdit()
+        self.stamp_order_id_edit.setPlaceholderText("仅填写数字 Order ID")
+        self.stamp_order_id_edit.setMaximumWidth(180)
+        self.load_stamp_replacement_button = QPushButton("读取邮票提交配置")
+        self.load_stamp_replacement_button.clicked.connect(self._load_stamp_replacement_context)
+        self.stamp_replacement_status_label = QLabel("尚未读取 Order")
+        load_layout.addWidget(compact_field("Order ID", self.stamp_order_id_edit))
+        load_layout.addWidget(self.load_stamp_replacement_button)
+        load_layout.addWidget(self.stamp_replacement_status_label)
+        load_layout.addStretch(1)
+        layout.addWidget(load_box)
+
+        form_box = QGroupBox("3. 邮票文件")
+        form_layout = QGridLayout(form_box)
+        self.replacement_stamp_edit = QLineEdit()
+        self.replacement_stamp_edit.setReadOnly(True)
+        self.select_replacement_stamp_button = QPushButton("选择 Stamp PDF")
+        self.select_replacement_stamp_button.clicked.connect(self._select_replacement_stamp)
+        self.replacement_stamp_type_combo = QComboBox()
+        self.replacement_gift_edit = QLineEdit()
+        self.replacement_gift_edit.setReadOnly(True)
+        self.select_replacement_gift_button = QPushButton("选择 Gift Message PDF（可选）")
+        self.select_replacement_gift_button.clicked.connect(self._select_replacement_gift)
+        form_layout.addWidget(QLabel("Stamp"), 0, 0)
+        form_layout.addWidget(self.replacement_stamp_edit, 0, 1)
+        form_layout.addWidget(self.select_replacement_stamp_button, 0, 2)
+        form_layout.addWidget(QLabel("Stamp Type"), 1, 0)
+        form_layout.addWidget(self.replacement_stamp_type_combo, 1, 1, 1, 2)
+        form_layout.addWidget(QLabel("Gift Message"), 2, 0)
+        form_layout.addWidget(self.replacement_gift_edit, 2, 1)
+        form_layout.addWidget(self.select_replacement_gift_button, 2, 2)
+        form_layout.setColumnStretch(1, 1)
+        layout.addWidget(form_box)
+        self.submit_stamp_replacement_button = QPushButton("确认并提交/替换邮票")
+        self.submit_stamp_replacement_button.clicked.connect(self._submit_stamp_replacement)
+        layout.addWidget(self.submit_stamp_replacement_button, 0, Qt.AlignmentFlag.AlignRight)
+        self.stamp_replacement_log_edit = QTextEdit()
+        self.stamp_replacement_log_edit.setReadOnly(True)
+        layout.addWidget(self.stamp_replacement_log_edit, 1)
 
     def _build_confirmation_ui(self, layout: QVBoxLayout) -> None:
         order_box = QGroupBox("2. 选择待确认 Order")
@@ -495,6 +650,11 @@ class MainWindow(QMainWindow):
             self._load_confirmation_products
         )
         self.confirmation_order_status_label = QLabel("尚未读取订单")
+        self.confirmation_shipping_stamp_label = QLabel("Order Shipping Stamp：尚未读取")
+        self.confirmation_shipping_stamp_label.setOpenExternalLinks(True)
+        self.confirmation_shipping_stamp_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextBrowserInteraction
+        )
         order_layout.addWidget(self.refresh_confirmation_orders_button, 0, 0)
         order_layout.addWidget(QLabel("直接 Order ID"), 0, 1)
         order_layout.addWidget(self.direct_confirmation_order_id_edit, 0, 2)
@@ -505,14 +665,25 @@ class MainWindow(QMainWindow):
         order_layout.addWidget(self.confirmation_order_combo, 2, 2)
         order_layout.addWidget(self.load_confirmation_products_button, 2, 3)
         order_layout.addWidget(self.confirmation_order_status_label, 3, 2, 1, 2)
+        order_layout.addWidget(self.confirmation_shipping_stamp_label, 4, 2, 1, 2)
         order_layout.setColumnStretch(2, 1)
         layout.addWidget(order_box)
 
         products_box = QGroupBox("3. Order 设计清单")
         products_layout = QVBoxLayout(products_box)
-        self.confirmation_product_table = QTableWidget(0, 7)
+        self.confirmation_product_table = QTableWidget(0, 9)
         self.confirmation_product_table.setHorizontalHeaderLabels(
-            ["缩略图", "ID", "设计名称", "产品状态", "Type Option", "Quantity", "处理结果"]
+            [
+                "缩略图",
+                "Product ID",
+                "设计名称",
+                "产品状态",
+                "Type Option",
+                "Quantity",
+                "Delete",
+                "Recustom",
+                "处理结果",
+            ]
         )
         self.confirmation_product_table.setEditTriggers(
             QAbstractItemView.EditTrigger.NoEditTriggers
@@ -524,8 +695,10 @@ class MainWindow(QMainWindow):
         confirmation_header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         confirmation_header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
         confirmation_header.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
-        confirmation_header.setSectionResizeMode(6, QHeaderView.ResizeMode.Interactive)
-        self.confirmation_product_table.setColumnWidth(6, 180)
+        confirmation_header.setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
+        confirmation_header.setSectionResizeMode(7, QHeaderView.ResizeMode.ResizeToContents)
+        confirmation_header.setSectionResizeMode(8, QHeaderView.ResizeMode.Interactive)
+        self.confirmation_product_table.setColumnWidth(8, 180)
         products_layout.addWidget(self.confirmation_product_table)
         layout.addWidget(products_box, 1)
 
@@ -581,6 +754,277 @@ class MainWindow(QMainWindow):
         self._append_confirmation_log(f"失败：{message}")
         QMessageBox.critical(self, "订单确认操作失败", message)
 
+    def _show_tab_error(self, log: QTextEdit, title: str, error: Exception | str) -> None:
+        message = str(error)
+        log.append(f"失败：{message}")
+        QMessageBox.critical(self, title, message)
+
+    def _load_seller_shops(self) -> None:
+        try:
+            client = self._require_client()
+        except HiPersonalizationError as exc:
+            self._show_worker_error(exc)
+            return
+
+        def task(*, progress_callback: Any) -> list[SellerShop]:
+            return client.fetch_seller_shops()
+
+        def done(shops: list[SellerShop]) -> None:
+            self.seller_shops = shops
+            self.seller_shop_combo.clear()
+            for shop in shops:
+                self.seller_shop_combo.addItem(shop.label, shop)
+            self.sku_query_status_label.setText(f"读取到 {len(shops)} 个 Shop")
+
+        self._run("正在读取 Seller Shop 列表……", task, done)
+
+    def _load_shop_products(self) -> None:
+        shop = self.seller_shop_combo.currentData()
+        if not isinstance(shop, SellerShop):
+            self._show_worker_error("请先读取并选择 Shop。")
+            return
+        client = self._require_client()
+
+        def task(
+            *, progress_callback: Any
+        ) -> tuple[list[ShopProduct], dict[int, bytes]]:
+            products = client.fetch_shop_products(shop)
+            thumbnails: dict[int, bytes] = {}
+            for index, product in enumerate(products):
+                if not product.image_url:
+                    continue
+                try:
+                    thumbnails[index] = client.fetch_thumbnail_bytes(product.image_url)
+                except Exception:
+                    continue
+            return products, thumbnails
+
+        def done(result: tuple[list[ShopProduct], dict[int, bytes]]) -> None:
+            self.shop_products, self.shop_product_thumbnails = result
+            self._filter_shop_products(self.shop_product_filter_edit.text())
+            self.sku_query_status_label.setText(
+                f"Shop {shop.shop_id}：读取到 {len(self.shop_products)} 个 Products"
+            )
+
+        self._run("正在读取 Shop Products……", task, done)
+
+    def _filter_shop_products(self, text: str) -> None:
+        if not hasattr(self, "shop_products_table"):
+            return
+        needle = text.strip().casefold()
+        matches = [
+            (index, product)
+            for index, product in enumerate(self.shop_products)
+            if not needle
+            or needle in product.name.casefold()
+            or needle in product.sku.casefold()
+        ]
+        self.shop_products_table.setRowCount(0)
+        for row, (source_index, product) in enumerate(matches):
+            self.shop_products_table.insertRow(row)
+            self.shop_products_table.setRowHeight(row, 64)
+            image_label = QLabel("无图片")
+            image_label.setFixedSize(56, 56)
+            image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            pixmap = QPixmap()
+            pixmap.loadFromData(self.shop_product_thumbnails.get(source_index, b""))
+            if not pixmap.isNull():
+                image_label.setText("")
+                image_label.setPixmap(
+                    pixmap.scaled(
+                        QSize(52, 52),
+                        Qt.AspectRatioMode.KeepAspectRatio,
+                        Qt.TransformationMode.SmoothTransformation,
+                    )
+                )
+            self.shop_products_table.setCellWidget(row, 0, image_label)
+            self.shop_products_table.setItem(row, 1, QTableWidgetItem(product.name))
+            self.shop_products_table.setItem(row, 2, QTableWidgetItem(product.sku))
+
+    def _load_recustom_context(self) -> None:
+        product_id = self.recustom_product_id_edit.text().strip()
+        try:
+            client = self._require_client()
+        except HiPersonalizationError as exc:
+            self._show_tab_error(self.recustom_log_edit, "替换设计操作失败", exc)
+            return
+
+        def task(*, progress_callback: Any) -> RecustomContext:
+            return client.prepare_recustom(product_id)
+
+        def done(context: RecustomContext) -> None:
+            self.recustom_context = context
+            self.recustom_code_edit.setText(context.product_code)
+            self.recustom_type_option_combo.clear()
+            selected_index = 0
+            for index, option in enumerate(context.type_options):
+                self.recustom_type_option_combo.addItem(option.label, option)
+                self.recustom_type_option_combo.setItemData(
+                    index, option.label, Qt.ItemDataRole.ToolTipRole
+                )
+                if option.value == context.selected_type_option:
+                    selected_index = index
+            if self.recustom_type_option_combo.count():
+                self.recustom_type_option_combo.setCurrentIndex(selected_index)
+            self.recustom_image_edit.clear()
+            self.recustom_status_label.setText(
+                f"Product {context.product_id} 配置读取成功；请选择新的 First Image"
+            )
+            self.recustom_log_edit.append(f"已读取 Product {context.product_id}。")
+            self._set_workflow_enabled(True)
+
+        self._run(
+            f"正在读取 Product {product_id} 的替换设计配置……",
+            task,
+            done,
+            on_error=lambda error: self._show_tab_error(
+                self.recustom_log_edit, "替换设计操作失败", error
+            ),
+            log_callback=self.recustom_log_edit.append,
+        )
+
+    def _select_recustom_image(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "选择新的 First Image", "", self.IMAGE_FILTER)
+        if path:
+            self.recustom_image_edit.setText(str(Path(path).resolve()))
+
+    def _submit_recustom(self) -> None:
+        context = self.recustom_context
+        option = self.recustom_type_option_combo.currentData()
+        image_path = self.recustom_image_edit.text().strip()
+        if context is None:
+            self._show_tab_error(self.recustom_log_edit, "替换设计操作失败", "请先读取 Product。")
+            return
+        if not isinstance(option, SelectOption) or not image_path:
+            self._show_tab_error(
+                self.recustom_log_edit,
+                "替换设计操作失败",
+                "请选择 Product Type Option 并上传新的 First Image。",
+            )
+            return
+        if QMessageBox.question(
+            self,
+            "确认替换设计",
+            f"即将替换 Product {context.product_id} 的设计图片和配置。是否继续？",
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        client = self._require_client()
+
+        def task(*, progress_callback: Any) -> str:
+            return client.submit_recustom(
+                context,
+                product_code=self.recustom_code_edit.text(),
+                type_option_value=option.value,
+                image_path=Path(image_path),
+            )
+
+        def done(result_url: str) -> None:
+            self.recustom_log_edit.append(f"替换设计提交成功：{result_url}")
+            self.recustom_status_label.setText(f"Product {context.product_id} 替换成功")
+            self.recustom_context = None
+            self._set_workflow_enabled(True)
+            QMessageBox.information(self, "替换设计成功", f"Product {context.product_id} 已更新。")
+
+        self._run(
+            f"正在替换 Product {context.product_id} 的设计……",
+            task,
+            done,
+            on_error=lambda error: self._show_tab_error(
+                self.recustom_log_edit, "替换设计操作失败", error
+            ),
+            log_callback=self.recustom_log_edit.append,
+        )
+
+    def _load_stamp_replacement_context(self) -> None:
+        order_id = self.stamp_order_id_edit.text().strip()
+        try:
+            client = self._require_client()
+        except HiPersonalizationError as exc:
+            self._show_tab_error(self.stamp_replacement_log_edit, "替补邮票操作失败", exc)
+            return
+
+        def task(*, progress_callback: Any) -> StampReplacementContext:
+            return client.prepare_stamp_replacement(order_id)
+
+        def done(context: StampReplacementContext) -> None:
+            self.stamp_replacement_context = context
+            self.replacement_stamp_type_combo.clear()
+            for option in context.stamp_types:
+                self.replacement_stamp_type_combo.addItem(option.label, option)
+            self.replacement_stamp_edit.clear()
+            self.replacement_gift_edit.clear()
+            self.stamp_replacement_status_label.setText(
+                f"Order {order_id} 配置读取成功；请选择 Stamp PDF"
+            )
+            self.stamp_replacement_log_edit.append(f"已读取 Order {order_id} 邮票配置。")
+            self._set_workflow_enabled(True)
+
+        self._run(
+            f"正在读取 Order {order_id} 的邮票配置……",
+            task,
+            done,
+            on_error=lambda error: self._show_tab_error(
+                self.stamp_replacement_log_edit, "替补邮票操作失败", error
+            ),
+            log_callback=self.stamp_replacement_log_edit.append,
+        )
+
+    def _select_replacement_stamp(self) -> None:
+        path = self._select_confirmation_pdf("选择 Stamp PDF")
+        if path:
+            self.replacement_stamp_edit.setText(path)
+
+    def _select_replacement_gift(self) -> None:
+        path = self._select_confirmation_pdf("选择 Gift Message PDF（可选）")
+        if path:
+            self.replacement_gift_edit.setText(path)
+
+    def _submit_stamp_replacement(self) -> None:
+        context = self.stamp_replacement_context
+        stamp_path = self.replacement_stamp_edit.text().strip()
+        gift_path = self.replacement_gift_edit.text().strip()
+        stamp_type = self.replacement_stamp_type_combo.currentData()
+        order_id = self.stamp_order_id_edit.text().strip()
+        if context is None or not stamp_path or not isinstance(stamp_type, SelectOption):
+            self._show_tab_error(
+                self.stamp_replacement_log_edit,
+                "替补邮票操作失败",
+                "请先读取 Order，并选择 Stamp PDF 和 Stamp Type。",
+            )
+            return
+        if QMessageBox.question(
+            self,
+            "确认提交/替换邮票",
+            f"即将为 Order {order_id} 提交或替换邮票文件。是否继续？",
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        client = self._require_client()
+
+        def task(*, progress_callback: Any) -> str:
+            return client.submit_stamp_replacement(
+                context,
+                stamp=Path(stamp_path),
+                stamp_type=stamp_type.value,
+                gift_message=Path(gift_path) if gift_path else None,
+            )
+
+        def done(result_url: str) -> None:
+            self.stamp_replacement_log_edit.append(f"邮票提交成功：{result_url}")
+            self.stamp_replacement_status_label.setText(f"Order {order_id} 邮票提交成功")
+            self.stamp_replacement_context = None
+            self._set_workflow_enabled(True)
+            QMessageBox.information(self, "替补邮票成功", f"Order {order_id} 的邮票已提交。")
+
+        self._run(
+            f"正在为 Order {order_id} 提交/替换邮票……",
+            task,
+            done,
+            on_error=lambda error: self._show_tab_error(
+                self.stamp_replacement_log_edit, "替补邮票操作失败", error
+            ),
+            log_callback=self.stamp_replacement_log_edit.append,
+        )
+
     def _set_workflow_enabled(self, enabled: bool) -> None:
         self.prepare_order_button.setEnabled(enabled and not self._busy and not self.order_id)
         self.continue_sku_button.setEnabled(
@@ -607,6 +1051,15 @@ class MainWindow(QMainWindow):
             self.existing_order_id_edit,
             self.existing_sku_edit,
             self.load_existing_order_button,
+            self.refresh_shops_button,
+            self.seller_shop_combo,
+            self.load_shop_products_button,
+            self.shop_product_filter_edit,
+            self.load_recustom_button,
+            self.recustom_product_id_edit,
+            self.load_stamp_replacement_button,
+            self.stamp_order_id_edit,
+            self.confirmation_product_table,
         ):
             widget.setEnabled(enabled and not self._busy)
         has_remaining = any(product.confirm_url for product in self.confirmation_products)
@@ -616,6 +1069,16 @@ class MainWindow(QMainWindow):
         self.shipping_stamp_button.setEnabled(documents_enabled)
         self.confirmation_stamp_type_combo.setEnabled(documents_enabled)
         self.gift_message_button.setEnabled(documents_enabled)
+        recustom_ready = enabled and not self._busy and self.recustom_context is not None
+        self.recustom_code_edit.setEnabled(recustom_ready)
+        self.recustom_type_option_combo.setEnabled(recustom_ready)
+        self.select_recustom_image_button.setEnabled(recustom_ready)
+        self.submit_recustom_button.setEnabled(recustom_ready)
+        stamp_ready = enabled and not self._busy and self.stamp_replacement_context is not None
+        self.replacement_stamp_type_combo.setEnabled(stamp_ready)
+        self.select_replacement_stamp_button.setEnabled(stamp_ready)
+        self.select_replacement_gift_button.setEnabled(stamp_ready)
+        self.submit_stamp_replacement_button.setEnabled(stamp_ready)
 
     def _set_busy(self, busy: bool) -> None:
         was_busy = self._busy
@@ -635,13 +1098,12 @@ class MainWindow(QMainWindow):
             QApplication.restoreOverrideCursor()
 
     def _workflow_tab_changed(self, index: int) -> None:
-        if (
-            index == 1
-            and not self._busy
-            and self.client is not None
-            and self.client.logged_in
-            and not self.confirmation_order_combo.count()
-        ):
+        if self._busy or self.client is None or not self.client.logged_in:
+            return
+        current = self.workflow_tabs.widget(index)
+        if current is self.sku_query_tab and not self.seller_shop_combo.count():
+            QTimer.singleShot(0, self._load_seller_shops)
+        elif current is self.confirmation_tab and not self.confirmation_order_combo.count():
             QTimer.singleShot(0, self._load_confirmation_orders)
 
     def _clear_confirmation_products(self) -> None:
@@ -657,6 +1119,7 @@ class MainWindow(QMainWindow):
         self.confirmation_requirement_label.setText(
             "首次确认必须上传 Shipping Stamp 并选择 Stamp Type；Gift Message 可选。"
         )
+        self.confirmation_shipping_stamp_label.setText("Order Shipping Stamp：尚未读取")
 
     def _reset_confirmation_state(self) -> None:
         if not hasattr(self, "confirmation_order_combo"):
@@ -673,6 +1136,31 @@ class MainWindow(QMainWindow):
         self._clear_confirmation_products()
         self.confirmation_order_status_label.setText("尚未读取订单")
         self.confirmation_log_edit.clear()
+
+    def _reset_auxiliary_state(self) -> None:
+        if not hasattr(self, "seller_shop_combo"):
+            return
+        self.seller_shops = []
+        self.shop_products = []
+        self.shop_product_thumbnails = {}
+        self.seller_shop_combo.clear()
+        self.shop_products_table.setRowCount(0)
+        self.shop_product_filter_edit.clear()
+        self.sku_query_status_label.setText("尚未读取 Shop Products")
+        self.recustom_context = None
+        self.recustom_product_id_edit.clear()
+        self.recustom_code_edit.clear()
+        self.recustom_type_option_combo.clear()
+        self.recustom_image_edit.clear()
+        self.recustom_status_label.setText("尚未读取 Product")
+        self.recustom_log_edit.clear()
+        self.stamp_replacement_context = None
+        self.stamp_order_id_edit.clear()
+        self.replacement_stamp_edit.clear()
+        self.replacement_stamp_type_combo.clear()
+        self.replacement_gift_edit.clear()
+        self.stamp_replacement_status_label.setText("尚未读取 Order")
+        self.stamp_replacement_log_edit.clear()
 
     def _filter_confirmation_orders(self, text: str) -> None:
         selected = self.confirmation_order_combo.currentData()
@@ -800,8 +1288,8 @@ class MainWindow(QMainWindow):
 
         def task(
             *, progress_callback: Any
-        ) -> tuple[list[ConfirmableProduct], list[SelectOption], dict[str, bytes]]:
-            products = client.fetch_order_products(order)
+        ) -> tuple[list[ConfirmableProduct], list[SelectOption], dict[str, bytes], str]:
+            products, shipping_stamp_url = client.fetch_order_products_page(order)
             first_remaining = next((product for product in products if product.confirm_url), None)
             stamp_types = (
                 list(client.prepare_confirmation(first_remaining).stamp_types)
@@ -818,12 +1306,14 @@ class MainWindow(QMainWindow):
                     )
                 except Exception:
                     continue
-            return products, stamp_types, thumbnails
+            return products, stamp_types, thumbnails, shipping_stamp_url
 
         def done(
-            result: tuple[list[ConfirmableProduct], list[SelectOption], dict[str, bytes]]
+            result: tuple[
+                list[ConfirmableProduct], list[SelectOption], dict[str, bytes], str
+            ]
         ) -> None:
-            products, stamp_types, thumbnails = result
+            products, stamp_types, thumbnails, shipping_stamp_url = result
             self.confirmation_products = products
             self.confirmation_product_thumbnails = thumbnails
             self.confirmation_requires_stamp = not any(
@@ -850,12 +1340,33 @@ class MainWindow(QMainWindow):
                     product.status,
                     product.type_option,
                     product.quantity,
-                    "待确认" if product.confirm_url else "已确认",
                 )
                 for column, value in enumerate(values):
                     item = QTableWidgetItem(value)
                     item.setToolTip(value)
                     self.confirmation_product_table.setItem(row, column + 1, item)
+                delete_button = QPushButton("Delete")
+                delete_button.setEnabled(bool(product.delete_url))
+                delete_button.clicked.connect(
+                    lambda _checked=False, selected=product: self._delete_confirmation_product(
+                        selected
+                    )
+                )
+                recustom_button = QPushButton("Recustom")
+                recustom_button.setEnabled(bool(product.recustom_url))
+                recustom_button.clicked.connect(
+                    lambda _checked=False, selected=product: self._open_product_in_recustom(
+                        selected
+                    )
+                )
+                self.confirmation_product_table.setCellWidget(row, 6, delete_button)
+                self.confirmation_product_table.setCellWidget(row, 7, recustom_button)
+                result_item = QTableWidgetItem(
+                    "待确认" if product.confirm_url else "已确认"
+                )
+                if not product.confirm_url:
+                    self._set_success_item_style(result_item)
+                self.confirmation_product_table.setItem(row, 8, result_item)
             self.confirmation_stamp_type_combo.clear()
             for option in stamp_types:
                 self.confirmation_stamp_type_combo.addItem(option.label, option)
@@ -873,6 +1384,17 @@ class MainWindow(QMainWindow):
             self.confirmation_order_status_label.setText(
                 f"Order {order.order_id}：共 {len(products)} 个设计，待确认 {remaining} 个，订单状态 {order.status or '-'}"
             )
+            if shipping_stamp_url:
+                safe_url = escape(shipping_stamp_url, quote=True)
+                self.confirmation_shipping_stamp_label.setText(
+                    f'Order Shipping Stamp：<a href="{safe_url}">打开 PDF</a>'
+                )
+                self.confirmation_shipping_stamp_label.setToolTip(shipping_stamp_url)
+            else:
+                self.confirmation_shipping_stamp_label.setText(
+                    "Order Shipping Stamp：该 Order 暂无邮票文件"
+                )
+                self.confirmation_shipping_stamp_label.setToolTip("")
             self._append_confirmation_log(
                 f"Order {order.order_id} 读取完成：{len(products)} 个设计，待确认 {remaining} 个。"
             )
@@ -884,6 +1406,50 @@ class MainWindow(QMainWindow):
             on_error=self._show_confirmation_error,
             log_callback=self._append_confirmation_log,
         )
+
+    def _delete_confirmation_product(self, product: ConfirmableProduct) -> None:
+        if not product.delete_url:
+            self._show_confirmation_error(f"Product {product.product_id} 没有 Delete 功能。")
+            return
+        answer = QMessageBox.warning(
+            self,
+            "确认删除设计",
+            f"即将在线删除 Product {product.product_id}（{product.title}）。\n"
+            "删除后无法由本工具恢复，是否继续？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        client = self._require_client()
+
+        def task(*, progress_callback: Any) -> str:
+            return client.delete_order_product(product)
+
+        def done(result_url: str) -> None:
+            self._append_confirmation_log(
+                f"Product {product.product_id} 已删除：{result_url}"
+            )
+            QMessageBox.information(
+                self, "删除成功", f"Product {product.product_id} 已从订单中删除。"
+            )
+            QTimer.singleShot(0, self._load_confirmation_products)
+
+        self._run(
+            f"正在删除 Product {product.product_id}……",
+            task,
+            done,
+            on_error=self._show_confirmation_error,
+            log_callback=self._append_confirmation_log,
+        )
+
+    def _open_product_in_recustom(self, product: ConfirmableProduct) -> None:
+        self.workflow_tabs.setCurrentWidget(self.recustom_tab)
+        self.recustom_product_id_edit.setText(product.product_id)
+        self.recustom_log_edit.append(
+            f"从订单确认页载入 Product {product.product_id}。"
+        )
+        QTimer.singleShot(0, self._load_recustom_context)
 
     def _select_confirmation_pdf(self, title: str) -> str:
         path, _ = QFileDialog.getOpenFileName(self, title, "", "PDF files (*.pdf)")
@@ -976,7 +1542,7 @@ class MainWindow(QMainWindow):
                     )
                     message = f"确认成功：{result_url}"
                     results.append((product.product_id, True, message))
-                    progress_callback.emit((product.product_id, "成功", message, index))
+                    progress_callback.emit((product.product_id, "已确认", message, index))
                 except Exception as exc:
                     message = str(exc)
                     results.append((product.product_id, False, message))
@@ -1001,8 +1567,12 @@ class MainWindow(QMainWindow):
             product_id, status, message, completed = value
             for row in range(self.confirmation_product_table.rowCount()):
                 if self.confirmation_product_table.item(row, 1).text() == product_id:
-                    self.confirmation_product_table.item(row, 6).setText(status)
-                    self.confirmation_product_table.item(row, 6).setToolTip(message)
+                    self.confirmation_product_table.item(row, 8).setText(status)
+                    self.confirmation_product_table.item(row, 8).setToolTip(message)
+                    if status == "已确认":
+                        self._set_success_item_style(
+                            self.confirmation_product_table.item(row, 8)
+                        )
                     break
             self.confirmation_progress_bar.setValue(completed)
 
@@ -1021,6 +1591,8 @@ class MainWindow(QMainWindow):
                     confirm_url="" if product.product_id in successful_ids else product.confirm_url,
                     image_url=product.image_url,
                     preview_url=product.preview_url,
+                    delete_url=product.delete_url,
+                    recustom_url=product.recustom_url,
                 )
                 for product in self.confirmation_products
             ]
@@ -1032,9 +1604,31 @@ class MainWindow(QMainWindow):
                 for row in range(self.confirmation_product_table.rowCount()):
                     if self.confirmation_product_table.item(row, 1).text() in successful_ids:
                         self.confirmation_product_table.item(row, 3).setText("image_confirmed")
+                        result_item = self.confirmation_product_table.item(row, 8)
+                        result_item.setText("已确认")
+                        self._set_success_item_style(result_item)
             self.confirmation_order_status_label.setText(
                 f"Order {order.order_id} 最新状态：{final_status}"
             )
+            if not final_status.casefold().startswith("状态读取失败"):
+                normalized_status = (
+                    "all_confirmed"
+                    if final_status.casefold().startswith("all_confirmed")
+                    else final_status
+                )
+                updated_order = replace(order, status=normalized_status)
+                self.confirmation_orders = [
+                    updated_order if item.order_id == order.order_id else item
+                    for item in self.confirmation_orders
+                ]
+                current_index = self.confirmation_order_combo.currentIndex()
+                if current_index >= 0:
+                    self.confirmation_order_combo.setItemData(
+                        current_index, updated_order, Qt.ItemDataRole.UserRole
+                    )
+                    self.confirmation_order_combo.setItemText(
+                        current_index, updated_order.label
+                    )
             self._append_confirmation_log(
                 f"Order {order.order_id}：成功 {successes}，失败 {failures}，最新状态 {final_status}。"
             )
@@ -1084,6 +1678,9 @@ class MainWindow(QMainWindow):
             if self._pending_auto_types:
                 self._pending_auto_types = False
                 QTimer.singleShot(0, self._load_types)
+            elif self._pending_auto_options:
+                self._pending_auto_options = False
+                QTimer.singleShot(0, self._load_type_options)
 
         worker.signals.finished.connect(finished)
         self.thread_pool.start(worker)
@@ -1114,6 +1711,7 @@ class MainWindow(QMainWindow):
             self.password_edit.setPlaceholderText("首次登录或密码失效时填写")
         if self.logged_in_username and username.strip() != self.logged_in_username:
             self._reset_confirmation_state()
+            self._reset_auxiliary_state()
             self.login_status_label.setText("账号已切换，请登录后继续")
             self._set_workflow_enabled(False)
 
@@ -1168,6 +1766,7 @@ class MainWindow(QMainWindow):
         self.logged_in_username = ""
         self._reset_order_state()
         self._reset_confirmation_state()
+        self._reset_auxiliary_state()
         self.order_title_edit.clear()
         self.sku_edit.clear()
         self._set_workflow_enabled(False)
@@ -1190,8 +1789,9 @@ class MainWindow(QMainWindow):
             self.password_edit.clear()
             self.login_status_label.setText("登录成功，订单流程已解锁")
             self._append_log("Seller 登录成功。")
-            if self.workflow_tabs.currentIndex() == 1:
-                QTimer.singleShot(0, self._load_confirmation_orders)
+            QTimer.singleShot(
+                0, lambda: self._workflow_tab_changed(self.workflow_tabs.currentIndex())
+            )
 
         def failed(error: Exception) -> None:
             if isinstance(error, AuthenticationError):
@@ -1228,6 +1828,7 @@ class MainWindow(QMainWindow):
         self.logged_in_username = ""
         self._reset_order_state()
         self._reset_confirmation_state()
+        self._reset_auxiliary_state()
         self._set_workflow_enabled(False)
         self.login_status_label.setText("账号已从本机删除，订单流程已锁定")
         self._load_account_choices()
@@ -1237,6 +1838,7 @@ class MainWindow(QMainWindow):
         self.created_order_title = ""
         self.batch_completed_successfully = False
         self._pending_auto_types = False
+        self._pending_auto_options = False
         if hasattr(self, "order_id_label"):
             self.order_id_label.setText("Order ID：尚未创建")
         self.available_type_options = []
@@ -1272,6 +1874,7 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(0)
         self.batch_completed_successfully = False
         self._pending_auto_types = False
+        self._pending_auto_options = False
         self.type_options_status_label.setText("尚未读取 Type Options")
 
     def _require_client(self) -> HiPersonalizationClient:
@@ -1467,12 +2070,28 @@ class MainWindow(QMainWindow):
             return client.fetch_types(self.order_id, definition.definition_id)
 
         def done(options: list[SelectOption]) -> None:
+            self.type_combo.blockSignals(True)
             self.type_combo.clear()
             for option in options:
                 self.type_combo.addItem(option.label, option)
+            self.type_combo.blockSignals(False)
             self._append_log(f"读取到 {len(options)} 个 Product Type。")
+            self._auto_load_type_options(self.type_combo.currentIndex())
 
         self._run("正在读取 Product Types……", task, done)
+
+    def _auto_load_type_options(self, index: int) -> None:
+        self._invalidate_type_options()
+        if (
+            index >= 0
+            and self.order_id
+            and isinstance(self.definition_combo.currentData(), DefinitionOption)
+            and isinstance(self.type_combo.currentData(), SelectOption)
+        ):
+            if self._busy:
+                self._pending_auto_options = True
+            else:
+                QTimer.singleShot(0, self._load_type_options)
 
     def _load_type_options(self) -> None:
         definition = self.definition_combo.currentData()
@@ -1503,7 +2122,7 @@ class MainWindow(QMainWindow):
                 )
             for row in range(self.file_table.rowCount()):
                 combo = self.file_table.cellWidget(row, 4)
-                if isinstance(combo, QComboBox):
+                if isinstance(combo, QComboBox) and combo.isEnabled():
                     self._fill_type_option_combo(combo)
             self.type_options_status_label.setText(f"已读取 {len(options)} 个 Type Options")
             self._append_log(f"读取到 {len(options)} 个 Type Option。")
@@ -1516,7 +2135,7 @@ class MainWindow(QMainWindow):
         self.type_options_status_label.setText("Product Type 已变化，请重新读取 Type Options")
         for row in range(self.file_table.rowCount()):
             combo = self.file_table.cellWidget(row, 4)
-            if isinstance(combo, QComboBox):
+            if isinstance(combo, QComboBox) and combo.isEnabled():
                 combo.clear()
 
     def _fill_type_option_combo(self, combo: QComboBox, selected_value: str = "") -> None:
@@ -1538,13 +2157,13 @@ class MainWindow(QMainWindow):
         for row in range(self.file_table.rowCount()):
             combo = self.file_table.cellWidget(row, 4)
             quantity = self.file_table.cellWidget(row, 5)
-            if isinstance(combo, QComboBox):
+            if isinstance(combo, QComboBox) and combo.isEnabled():
                 for index in range(combo.count()):
                     option = combo.itemData(index)
                     if isinstance(option, SelectOption) and option.value == default_option.value:
                         combo.setCurrentIndex(index)
                         break
-            if isinstance(quantity, QSpinBox):
+            if isinstance(quantity, QSpinBox) and quantity.isEnabled():
                 quantity.setValue(self.batch_quantity_spin.value())
         self._append_log(f"已将相同的 Type Option 和 Quantity 应用到 {self.file_table.rowCount()} 张图片。")
 
@@ -1552,13 +2171,32 @@ class MainWindow(QMainWindow):
     def _format_size(size: int) -> str:
         return f"{size / 1024 / 1024:.2f} MB"
 
+    @staticmethod
+    def _set_success_item_style(item: QTableWidgetItem) -> None:
+        item.setBackground(QBrush(QColor("#C6EFCE")))
+        item.setForeground(QBrush(QColor("#006100")))
+
+    def _set_submission_row_status(
+        self, row: int, status: str, message: str = ""
+    ) -> None:
+        if not 0 <= row < self.file_table.rowCount():
+            return
+        status_item = self.file_table.item(row, 7)
+        message_item = self.file_table.item(row, 8)
+        status_item.setText(status)
+        message_item.setText(message)
+        message_item.setToolTip(message)
+        if status in {"成功", "已跳过"}:
+            self._set_success_item_style(status_item)
+            for column in range(2, 6):
+                control = self.file_table.cellWidget(row, column)
+                if control is not None:
+                    control.setEnabled(False)
+
     def _add_files(self) -> None:
         paths, _ = QFileDialog.getOpenFileNames(self, "选择设计图片", "", self.IMAGE_FILTER)
-        existing = {self.file_table.item(row, 1).data(256) for row in range(self.file_table.rowCount())}
         for raw_path in paths:
             path = Path(raw_path).resolve()
-            if str(path) in existing:
-                continue
             row = self.file_table.rowCount()
             self.file_table.insertRow(row)
             self.file_table.setRowHeight(row, 64)
@@ -1599,7 +2237,6 @@ class MainWindow(QMainWindow):
             self.file_table.setItem(row, 6, QTableWidgetItem(self._format_size(path.stat().st_size)))
             self.file_table.setItem(row, 7, QTableWidgetItem("待提交"))
             self.file_table.setItem(row, 8, QTableWidgetItem(""))
-            existing.add(str(path))
 
     def _show_image_preview(self, image_path: Path) -> None:
         ImagePreviewDialog(image_path, self).exec()
@@ -1691,28 +2328,39 @@ class MainWindow(QMainWindow):
 
         def task(*, progress_callback: Any) -> list[SubmissionResult]:
             results: list[SubmissionResult] = []
-            for index, submission in enumerate(submission_tasks, start=1):
+            for row_index, submission in enumerate(submission_tasks):
+                index = row_index + 1
                 image_path = submission.image_path
-                if self.store.was_successful(self.order_id, image_path):
-                    result = SubmissionResult(image_path, True, "已成功提交过，本次跳过。")
+                code = build_product_code(
+                    order_title,
+                    submission.code_suffix,
+                    is_back=submission.is_back,
+                )
+                submission_identity = {
+                    "type_option": submission.type_option.value,
+                    "quantity": submission.quantity,
+                    "product_code": code,
+                }
+                if self.store.was_successful(
+                    self.order_id, image_path, **submission_identity
+                ):
+                    result = SubmissionResult(
+                        image_path, True, "相同图片、选项、数量及产品代码已成功提交，本次跳过。"
+                    )
                     results.append(result)
-                    progress_callback.emit((str(image_path), "已跳过", result.message, index))
+                    progress_callback.emit((row_index, "已跳过", result.message, index))
                     continue
                 self.store.record(
                     order_id=self.order_id,
                     image_path=image_path,
+                    **submission_identity,
                     order_title=order_title,
                     status="running",
                 )
-                progress_callback.emit((str(image_path), "提交中", "", index - 1))
+                progress_callback.emit((row_index, "提交中", "", index - 1))
                 try:
                     context = client.prepare_upload(
                         self.order_id, definition.definition_id, product_type.value
-                    )
-                    code = build_product_code(
-                        order_title,
-                        submission.code_suffix,
-                        is_back=submission.is_back,
                     )
                     result_url = client.submit_image(
                         context,
@@ -1731,23 +2379,20 @@ class MainWindow(QMainWindow):
                 self.store.record(
                     order_id=self.order_id,
                     image_path=image_path,
+                    **submission_identity,
                     order_title=order_title,
                     status=status,
                     message=message,
                 )
                 results.append(result)
                 progress_callback.emit(
-                    (str(image_path), "成功" if result.success else "失败", message, index)
+                    (row_index, "成功" if result.success else "失败", message, index)
                 )
             return results
 
-        def progress(value: tuple[str, str, str, int]) -> None:
-            path, status, message, completed = value
-            for row in range(self.file_table.rowCount()):
-                if self.file_table.item(row, 1).data(256) == path:
-                    self.file_table.item(row, 7).setText(status)
-                    self.file_table.item(row, 8).setText(message)
-                    break
+        def progress(value: tuple[int, str, str, int]) -> None:
+            row, status, message, completed = value
+            self._set_submission_row_status(row, status, message)
             self.progress_bar.setValue(completed)
 
         def done(results: list[SubmissionResult]) -> None:
