@@ -10,7 +10,7 @@ from .gui import MainWindow
 from .resources import resource_path
 
 
-APPLICATION_NAME = "hipersonalization订单处理助手 v0.13 by Robin+Codex"
+APPLICATION_NAME = "hipersonalization订单处理助手 v0.14 by Robin+Codex"
 
 
 def main() -> int:

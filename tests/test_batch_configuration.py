@@ -12,9 +12,11 @@ from hipersonalization_assistant.config import Settings
 from hipersonalization_assistant.models import (
     ConfirmationContext,
     ConfirmableProduct,
+    DefinitionOption,
     OrderSummary,
     ProductOption,
     SelectOption,
+    UploadContext,
     build_product_code,
 )
 
@@ -85,6 +87,55 @@ def test_each_image_can_have_independent_option_quantity_and_suffix(tmp_path: Pa
     application.processEvents()
 
 
+def test_same_image_can_be_added_more_than_once(tmp_path: Path, monkeypatch):
+    application = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(gui_module, "app_data_dir", lambda: tmp_path / "app-data")
+    image = tmp_path / "same.png"
+    image.write_bytes(b"image")
+    monkeypatch.setattr(
+        gui_module.QFileDialog,
+        "getOpenFileNames",
+        lambda *args, **kwargs: ([str(image)], "Images"),
+    )
+    window = gui_module.MainWindow(Settings())
+
+    window._add_files()
+    window._add_files()
+
+    assert window.file_table.rowCount() == 2
+    assert window.file_table.item(0, 1).data(256) == window.file_table.item(1, 1).data(256)
+    window.close()
+    application.processEvents()
+
+
+def test_successful_submission_row_is_green_and_configuration_is_locked(
+    tmp_path: Path, monkeypatch
+):
+    application = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(gui_module, "app_data_dir", lambda: tmp_path / "app-data")
+    image = tmp_path / "success.png"
+    image.write_bytes(b"image")
+    monkeypatch.setattr(
+        gui_module.QFileDialog,
+        "getOpenFileNames",
+        lambda *args, **kwargs: ([str(image)], "Images"),
+    )
+    window = gui_module.MainWindow(Settings())
+    window.available_type_options = [SelectOption("001", "Option 001")]
+    window._add_files()
+
+    window._set_submission_row_status(0, "成功", "提交成功")
+
+    assert window.file_table.item(0, 7).text() == "成功"
+    assert window.file_table.item(0, 7).background().color().name() == "#c6efce"
+    assert all(
+        not window.file_table.cellWidget(0, column).isEnabled()
+        for column in range(2, 6)
+    )
+    window.close()
+    application.processEvents()
+
+
 def test_apply_defaults_updates_all_image_rows(tmp_path: Path, monkeypatch):
     application = QApplication.instance() or QApplication([])
     monkeypatch.setattr(gui_module, "app_data_dir", lambda: tmp_path / "app-data")
@@ -111,6 +162,48 @@ def test_apply_defaults_updates_all_image_rows(tmp_path: Path, monkeypatch):
 
     tasks = window._submission_tasks()
     assert [(task.type_option.value, task.quantity) for task in tasks] == [("b", 12), ("b", 12)]
+    window.close()
+    application.processEvents()
+
+
+def test_product_type_selection_automatically_loads_type_options(tmp_path: Path, monkeypatch):
+    application = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(gui_module, "app_data_dir", lambda: tmp_path / "app-data")
+
+    class FakeClient:
+        logged_in = True
+
+        def fetch_types(self, order_id, definition_id):
+            return [SelectOption("custom", "Custom")]
+
+        def prepare_upload(self, order_id, definition_id, type_value):
+            return UploadContext(
+                "https://example/upload",
+                (("state", "token"),),
+                (SelectOption("front", "Front"), SelectOption("back", "Back")),
+            )
+
+    window = gui_module.MainWindow(Settings())
+    window.account_combo.setCurrentText("seller-one")
+    window.logged_in_username = "seller-one"
+    window.client = FakeClient()
+    window.order_id = "162372"
+    window.definition_combo.blockSignals(True)
+    window.definition_combo.addItem("Definition", DefinitionOption("10", "Definition"))
+    window.definition_combo.blockSignals(False)
+
+    def run_now(label, function, on_result, on_progress=None, **kwargs):
+        on_result(function(progress_callback=None))
+
+    monkeypatch.setattr(window, "_run", run_now)
+    window._load_types()
+    application.processEvents()
+
+    assert [
+        window.batch_type_option_combo.itemData(index).value
+        for index in range(window.batch_type_option_combo.count())
+    ] == ["front", "back"]
+    window.client = None
     window.close()
     application.processEvents()
 
@@ -174,12 +267,36 @@ def test_workflow_tabs_and_configuration_layout(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(gui_module, "app_data_dir", lambda: tmp_path / "app-data")
     window = gui_module.MainWindow(Settings())
 
-    assert window.windowTitle() == "hipersonalization订单处理助手 v0.13 by Robin+Codex"
+    assert window.windowTitle() == "hipersonalization订单处理助手 v0.14 by Robin+Codex"
     assert window.account_combo.minimumWidth() == window.password_edit.minimumWidth()
     assert not window.windowIcon().isNull()
-    assert window.workflow_tabs.count() == 2
+    assert window.workflow_tabs.count() == 5
     assert window.workflow_tabs.tabText(0) == "订单提交"
     assert window.workflow_tabs.tabText(1) == "订单确认"
+    assert window.workflow_tabs.tabText(2) == "替换设计"
+    assert window.workflow_tabs.tabText(3) == "替补邮票"
+    assert window.workflow_tabs.tabText(4) == "SKU 查询"
+    shop_header = window.shop_products_table.horizontalHeader()
+    assert shop_header.sectionResizeMode(1) == gui_module.QHeaderView.ResizeMode.Stretch
+    assert shop_header.sectionResizeMode(2) == gui_module.QHeaderView.ResizeMode.Stretch
+    for label in (
+        window.recustom_instructions_label,
+        window.stamp_replacement_instructions_label,
+    ):
+        assert label.text().startswith("功能说明：\n")
+        assert not label.font().bold()
+        assert label.font().pointSize() == window.font().pointSize()
+        assert "background-color: #FCE4EC" in label.styleSheet()
+    assert window.recustom_instructions_label.text().splitlines() == [
+        "功能说明：",
+        "1.用于替换订单内product的设计，注意是填写Product ID。",
+        "2.已confirm且未生产的订单亦可以替换（需和生产人员沟通清楚）。",
+        "3.注意！已生产的订单请勿修改设计图。",
+    ]
+    assert window.stamp_replacement_instructions_label.text().splitlines() == [
+        "功能说明：",
+        "1.只用于已confirm的订单，可替换订单的邮票（需和生产人员沟通清楚）。",
+    ]
 
     for control in (
         window.order_title_edit,
@@ -261,6 +378,60 @@ def test_confirmation_controls_distinguish_first_run_and_retry(tmp_path: Path, m
     application.processEvents()
 
 
+def test_loading_confirmed_products_shows_stamp_and_keeps_recustom_enabled(
+    tmp_path: Path, monkeypatch
+):
+    application = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(gui_module, "app_data_dir", lambda: tmp_path / "app-data")
+    stamp_url = "https://hipersonalization.com/uploads/shipping-label.pdf"
+
+    class FakeClient:
+        logged_in = True
+
+        def fetch_order_products_page(self, order):
+            return (
+                [
+                    ConfirmableProduct(
+                        "220486",
+                        "Front",
+                        "image_confirmed",
+                        "FRONT",
+                        "1",
+                        recustom_url=(
+                            "https://hipersonalization.com/recustom-order-generate-image/"
+                            "?image_order_product_id=220486"
+                        ),
+                    )
+                ],
+                stamp_url,
+            )
+
+    window = gui_module.MainWindow(Settings())
+    window.account_combo.setCurrentText("seller-one")
+    window.logged_in_username = "seller-one"
+    window.client = FakeClient()
+    order = OrderSummary("162372", "Order A", "all_confirmed", "https://example/products")
+    window.confirmation_order_combo.addItem(order.label, order)
+
+    def run_now(label, function, on_result, on_progress=None, **kwargs):
+        on_result(function(progress_callback=None))
+
+    monkeypatch.setattr(window, "_run", run_now)
+    window._load_confirmation_products()
+
+    assert stamp_url in window.confirmation_shipping_stamp_label.toolTip()
+    assert "打开 PDF" in window.confirmation_shipping_stamp_label.text()
+    recustom_button = window.confirmation_product_table.cellWidget(0, 7)
+    assert recustom_button.isEnabled()
+    result_item = window.confirmation_product_table.item(0, 8)
+    assert result_item.text() == "已确认"
+    assert result_item.background().color().name() == "#c6efce"
+
+    window.client = None
+    window.close()
+    application.processEvents()
+
+
 def test_confirmation_batch_uploads_stamp_only_to_first_design(tmp_path: Path, monkeypatch):
     application = QApplication.instance() or QApplication([])
     monkeypatch.setattr(gui_module, "app_data_dir", lambda: tmp_path / "app-data")
@@ -313,9 +484,20 @@ def test_confirmation_batch_uploads_stamp_only_to_first_design(tmp_path: Path, m
     for row, product in enumerate(window.confirmation_products):
         window.confirmation_product_table.insertRow(row)
         for column, value in enumerate(
-            (product.product_id, product.title, product.status, product.type_option, product.quantity, "待确认")
+            (
+                product.product_id,
+                product.title,
+                product.status,
+                product.type_option,
+                product.quantity,
+            )
         ):
-            window.confirmation_product_table.setItem(row, column + 1, gui_module.QTableWidgetItem(value))
+            window.confirmation_product_table.setItem(
+                row, column + 1, gui_module.QTableWidgetItem(value)
+            )
+        window.confirmation_product_table.setItem(
+            row, 8, gui_module.QTableWidgetItem("待确认")
+        )
     window.confirmation_stamp_type_combo.addItem("letter", SelectOption("letter", "letter"))
     window.shipping_stamp_edit.setText(str(shipping))
     window.gift_message_edit.setText(str(gift))
@@ -333,6 +515,17 @@ def test_confirmation_batch_uploads_stamp_only_to_first_design(tmp_path: Path, m
     assert calls[1]["stamp_type"] == ""
     assert calls[1]["gift_message"] is None
     assert all(not product.confirm_url for product in window.confirmation_products)
+    assert window.confirmation_order_combo.currentData().status == "all_confirmed"
+    assert all(
+        window.confirmation_product_table.item(row, 3).text() == "image_confirmed"
+        for row in range(window.confirmation_product_table.rowCount())
+    )
+    assert all(
+        window.confirmation_product_table.item(row, 8).text() == "已确认"
+        and window.confirmation_product_table.item(row, 8).background().color().name()
+        == "#c6efce"
+        for row in range(window.confirmation_product_table.rowCount())
+    )
 
     window.client = None
     window.close()

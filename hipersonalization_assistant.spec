@@ -27,7 +27,7 @@ exe = EXE(
     analysis.binaries,
     analysis.datas,
     [],
-    name="hipersonalization订单处理助手 v0.13 by Robin+Codex",
+    name="hipersonalization订单处理助手 v0.14 by Robin+Codex",
     icon="assets/hipersonalization.ico",
     debug=False,
     bootloader_ignore_signals=False,
